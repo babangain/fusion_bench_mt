@@ -1,7 +1,6 @@
 _target_: fusion_bench.modelpool.CausalLMPool
 models:
   _pretrained_: meta-llama/Llama-3.2-1B
-  hindi: baban/MT_En_Hindi
   bengali: baban/MT_En_Bengali
   tamil: baban/MT_En_Tamil
   telugu: baban/MT_En_Telugu
