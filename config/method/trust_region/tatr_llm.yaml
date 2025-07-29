@@ -1,4 +1,4 @@
-_target_: TaskArithmeticWithTrustRegionForCausalLM
+_target_: fusion_bench.method.trust_region.tatr_llm.TaskArithmeticWithTrustRegionForCausalLM
 scaling_factor: 0.3
 threshold_quantile: 0.99
 max_samples: 128
