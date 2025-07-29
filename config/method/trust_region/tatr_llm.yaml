@@ -4,3 +4,4 @@ threshold_quantile: 0.99
 max_samples: 128
 batch_size: 128
 zero_shot: true
+tokenizer: meta-llama/Llama-3.2-1B
