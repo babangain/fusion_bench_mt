@@ -8,22 +8,23 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 
 from .utils import state_dict_to_vector, vector_to_state_dict
+from fusion_bench import BaseModelPool
 
 log = logging.getLogger(__name__)
+
 
 def trainable_state_dict(module: nn.Module) -> Dict[str, Tensor]:
     return {
         name: param for name, param in module.named_parameters() if param.requires_grad
     }
 
-def state_dict_sub(target_sd: Dict[str, Tensor], base_sd: Dict[str, Tensor]) -> Dict[str, Tensor]:
-    """Subtract base state dict from target state dict."""
-    return {
-        k: target_sd[k] - base_sd[k] for k in target_sd if k in base_sd
-    }
+
+def state_dict_sub(dict_a: Dict[str, Tensor], dict_b: Dict[str, Tensor]) -> Dict[str, Tensor]:
+    return {k: dict_a[k] - dict_b[k] for k in dict_a if k in dict_b}
+
 
 class TaskArithmeticWithTrustRegionForCausalLM:
     def __init__(
@@ -44,22 +45,32 @@ class TaskArithmeticWithTrustRegionForCausalLM:
         self.zero_shot = zero_shot
         self.device = device
 
-    def run(self, pretrained_model, finetuned_models: Dict[str, nn.Module], datasets: Dict[str, List[str]]):
+    def run(self, modelpool: BaseModelPool, train_datasets: Dict[str, List[str]]):
+        # Load pretrained model and finetuned models
+        pretrained_model = modelpool.load_pretrained_model()
         pretrained_model = deepcopy(pretrained_model).to(self.device).eval()
         pretrained_sd = trainable_state_dict(pretrained_model)
+
+        finetuned_models = {
+            name: model.to(self.device).eval()
+            for name, model in modelpool.named_models()
+        }
+
+        # Compute task vectors
         task_vectors = {
             name: state_dict_sub(trainable_state_dict(model), pretrained_sd)
             for name, model in finetuned_models.items()
         }
-        task_vectors = {k: state_dict_to_vector(v) for k, v in task_vectors.items()}
+        task_vectors = {name: state_dict_to_vector(vec) for name, vec in task_vectors.items()}
 
-        if not self.zero_shot:
-            all_avg_abs_grads = self.compute_avg_abs_grads(pretrained_model, datasets)
-            all_avg_abs_grads = {k: state_dict_to_vector(v) for k, v in all_avg_abs_grads.items()}
-        else:
+        # Get trust region
+        if self.zero_shot:
             all_avg_abs_grads = {name: tv.abs() for name, tv in task_vectors.items()}
+        else:
+            all_avg_abs_grads = self.compute_avg_abs_grads(pretrained_model, train_datasets)
+            all_avg_abs_grads = {name: state_dict_to_vector(g) for name, g in all_avg_abs_grads.items()}
 
-        # Trust region calculation
+        # Compute Omega (trust region overlap)
         Omega = torch.zeros_like(next(iter(all_avg_abs_grads.values())))
         for i in all_avg_abs_grads:
             for j in all_avg_abs_grads:
@@ -71,13 +82,16 @@ class TaskArithmeticWithTrustRegionForCausalLM:
         threshold = values[min(threshold_idx, Omega.numel() - 1)]
         mask = Omega < threshold
 
+        # Apply trust region mask
         for task in task_vectors:
             task_vectors[task] = task_vectors[task] * mask
 
+        # Sum of all masked task vectors
         task_vector_sum = sum(task_vectors.values())
         task_vector_sum = vector_to_state_dict(task_vector_sum, pretrained_sd)
 
-        if isinstance(self.scaling_factor, (int, float)):
+        # Apply scaled vector to model
+        if isinstance(self.scaling_factor, (float, int)):
             for name, param in pretrained_model.named_parameters():
                 if name in task_vector_sum:
                     param.data += task_vector_sum[name].to(param.device) * self.scaling_factor
@@ -92,32 +106,36 @@ class TaskArithmeticWithTrustRegionForCausalLM:
                 models[sf] = model
             return models
         else:
-            raise ValueError("Invalid scaling_factor type")
+            raise ValueError("Invalid type for scaling_factor.")
 
-    def compute_avg_abs_grads(self, model, datasets: Dict[str, List[str]]):
-        model.train()
-        grads = {}
+    def compute_avg_abs_grads(
+        self, pretrained_model: nn.Module, train_datasets: Dict[str, List[str]]
+    ) -> Dict[str, Dict[str, Tensor]]:
+        pretrained_model.train()
+        all_avg_abs_grads = {}
 
-        for task_name, texts in datasets.items():
+        for task_name, texts in train_datasets.items():
             dataloader = DataLoader(texts, batch_size=self.batch_size, shuffle=True)
-            grad_accum = defaultdict(lambda: torch.zeros_like(next(model.parameters())))
-
+            grad_accum = defaultdict(float)
             num_samples = 0
+
             for batch in dataloader:
                 inputs = self.tokenizer(batch, return_tensors='pt', padding=True, truncation=True).to(self.device)
-                outputs = model(**inputs, labels=inputs["input_ids"])
+                outputs = pretrained_model(**inputs, labels=inputs["input_ids"])
                 loss = outputs.loss
 
-                model.zero_grad()
+                pretrained_model.zero_grad()
                 loss.backward()
 
-                for name, param in model.named_parameters():
+                for name, param in pretrained_model.named_parameters():
                     if param.grad is not None and param.requires_grad:
                         grad_accum[name] += param.grad.abs().detach().cpu()
+
                 num_samples += len(batch)
                 if num_samples >= self.max_samples:
                     break
 
-            grads[task_name] = {k: v / num_samples for k, v in grad_accum.items()}
+            avg_grads = {k: v / num_samples for k, v in grad_accum.items()}
+            all_avg_abs_grads[task_name] = avg_grads
 
-        return grads
+        return all_avg_abs_grads
