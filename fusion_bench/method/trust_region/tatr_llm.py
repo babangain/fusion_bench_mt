@@ -87,8 +87,9 @@ class TaskArithmeticWithTrustRegionForCausalLM:
                         Omega[name] += all_avg_abs_grads[i][name] * task_vectors[j][name].abs()
 
         # Flatten all Omega tensors to compute global threshold
-        all_values = torch.cat([v.flatten() for v in Omega.values()])
+        all_values = torch.cat([v.flatten() for v in Omega.values()]).float()
         threshold = torch.quantile(all_values, self.threshold_quantile)
+
 
         # Build mask
         mask = {k: (v < threshold).to(torch.bfloat16) for k, v in Omega.items()}
