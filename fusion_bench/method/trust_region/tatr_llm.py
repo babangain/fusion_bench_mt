@@ -1,4 +1,3 @@
-
 import logging
 from collections import defaultdict
 from copy import deepcopy
@@ -11,13 +10,19 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer
 
-from .utils import state_dict_to_vector, vector_to_state_dict, state_dict_sub
+from .utils import state_dict_to_vector, vector_to_state_dict
 
 log = logging.getLogger(__name__)
 
 def trainable_state_dict(module: nn.Module) -> Dict[str, Tensor]:
     return {
         name: param for name, param in module.named_parameters() if param.requires_grad
+    }
+
+def state_dict_sub(target_sd: Dict[str, Tensor], base_sd: Dict[str, Tensor]) -> Dict[str, Tensor]:
+    """Subtract base state dict from target state dict."""
+    return {
+        k: target_sd[k] - base_sd[k] for k in target_sd if k in base_sd
     }
 
 class TaskArithmeticWithTrustRegionForCausalLM:
@@ -54,7 +59,7 @@ class TaskArithmeticWithTrustRegionForCausalLM:
         else:
             all_avg_abs_grads = {name: tv.abs() for name, tv in task_vectors.items()}
 
-        # Trust region
+        # Trust region calculation
         Omega = torch.zeros_like(next(iter(all_avg_abs_grads.values())))
         for i in all_avg_abs_grads:
             for j in all_avg_abs_grads:
