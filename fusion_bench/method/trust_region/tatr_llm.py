@@ -4,12 +4,9 @@ from copy import deepcopy
 from typing import Dict, Iterable, List, Union
 
 import torch
-import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 from transformers import PreTrainedTokenizer
-
 from fusion_bench import BaseModelPool
 
 log = logging.getLogger(__name__)
@@ -17,26 +14,16 @@ log = logging.getLogger(__name__)
 
 def trainable_state_dict(module: nn.Module) -> Dict[str, Tensor]:
     return {
-        name: param for name, param in module.named_parameters() if param.requires_grad
+        name: param.detach().clone() for name, param in module.named_parameters()
+        if param.requires_grad
     }
 
 
 def state_dict_sub(dict_a: Dict[str, Tensor], dict_b: Dict[str, Tensor]) -> Dict[str, Tensor]:
-    return {k: dict_a[k] - dict_b[k] for k in dict_a if k in dict_b}
-
-
-def state_dict_to_vector(sd: Dict[str, Tensor]) -> Tensor:
-    return torch.cat([p.flatten() for p in sd.values()])
-
-
-def vector_to_state_dict(vec: Tensor, reference_sd: Dict[str, Tensor]) -> Dict[str, Tensor]:
-    result = {}
-    offset = 0
-    for k, v in reference_sd.items():
-        numel = v.numel()
-        result[k] = vec[offset: offset + numel].view_as(v).clone()
-        offset += numel
-    return result
+    return {
+        k: dict_a[k].cpu().to(torch.bfloat16) - dict_b[k].cpu().to(torch.bfloat16)
+        for k in dict_a if k in dict_b
+    }
 
 
 class TaskArithmeticWithTrustRegionForCausalLM:
@@ -58,59 +45,66 @@ class TaskArithmeticWithTrustRegionForCausalLM:
         self.zero_shot = zero_shot
         self.device = device
 
+    @torch.no_grad()
     def run(
         self,
         modelpool: BaseModelPool,
-        train_datasets: Union[None, Dict[str, List[str]]] = None
+        train_datasets: Union[None, Dict[str, List[str]]] = None,
     ):
-        # Load models
-        pretrained_model = modelpool.load_pretrained_model()
-        pretrained_model = deepcopy(pretrained_model).to(self.device).eval()
+        # Load and prepare models
+        pretrained_model = deepcopy(modelpool.load_pretrained_model()).to(self.device, dtype=torch.bfloat16).eval()
         pretrained_sd = trainable_state_dict(pretrained_model)
 
         finetuned_models = {
-            name: model.to(self.device).eval()
+            name: model.to(self.device, dtype=torch.bfloat16).eval()
             for name, model in modelpool.named_models()
         }
 
-        # Task vectors
+        # Task vectors: difference of finetuned - pretrained
         task_vectors = {
             name: state_dict_sub(trainable_state_dict(model), pretrained_sd)
             for name, model in finetuned_models.items()
         }
-        task_vectors = {name: state_dict_to_vector(vec) for name, vec in task_vectors.items()}
 
-        # Trust region vectors
+        # Trust region gradients
         if self.zero_shot:
-            all_avg_abs_grads = {name: tv.abs() for name, tv in task_vectors.items()}
+            all_avg_abs_grads = {
+                name: {k: v.abs() for k, v in vec.items()} for name, vec in task_vectors.items()
+            }
         else:
             if train_datasets is None:
                 raise ValueError("train_datasets must be provided when zero_shot=False.")
             all_avg_abs_grads = self.compute_avg_abs_grads(pretrained_model, train_datasets)
-            all_avg_abs_grads = {
-                name: state_dict_to_vector(grad) for name, grad in all_avg_abs_grads.items()
-            }
 
-        # Trust region mask
-        Omega = torch.zeros_like(next(iter(all_avg_abs_grads.values())))
+        # Build Omega (trust region mask) in parameter-wise dict form
+        param_keys = list(next(iter(task_vectors.values())).keys())
+        Omega = {k: torch.zeros_like(v) for k, v in task_vectors[next(iter(task_vectors))].items()}
+
         for i in all_avg_abs_grads:
-            for j in all_avg_abs_grads:
+            for j in task_vectors:
                 if i != j:
-                    Omega += all_avg_abs_grads[i] * task_vectors[j].abs()
+                    for name in Omega:
+                        Omega[name] += all_avg_abs_grads[i][name] * task_vectors[j][name].abs()
 
-        values, _ = Omega.sort(descending=False)
-        threshold_idx = int(Omega.numel() * self.threshold_quantile)
-        threshold = values[min(threshold_idx, Omega.numel() - 1)]
-        mask = Omega < threshold
+        # Flatten all Omega tensors to compute global threshold
+        all_values = torch.cat([v.flatten() for v in Omega.values()])
+        threshold = torch.quantile(all_values, self.threshold_quantile)
 
-        # Masked task vectors
+        # Build mask
+        mask = {k: (v < threshold).to(torch.bfloat16) for k, v in Omega.items()}
+
+        # Apply mask to each task vector
         for task in task_vectors:
-            task_vectors[task] = task_vectors[task] * mask
+            for name in task_vectors[task]:
+                task_vectors[task][name] = task_vectors[task][name] * mask[name]
 
-        task_vector_sum = sum(task_vectors.values())
-        task_vector_sum = vector_to_state_dict(task_vector_sum, pretrained_sd)
+        # Sum masked vectors
+        task_vector_sum = {k: torch.zeros_like(v) for k, v in pretrained_sd.items()}
+        for vec in task_vectors.values():
+            for name in vec:
+                task_vector_sum[name] += vec[name]
 
-        # Merge into pretrained
+        # Merge into models
         if isinstance(self.scaling_factor, (float, int)):
             for name, param in pretrained_model.named_parameters():
                 if name in task_vector_sum:
@@ -135,29 +129,35 @@ class TaskArithmeticWithTrustRegionForCausalLM:
         pretrained_model: nn.Module,
         train_datasets: Dict[str, List[str]]
     ) -> Dict[str, Dict[str, Tensor]]:
-        pretrained_model.train()
         all_avg_abs_grads = {}
 
         for task_name, texts in train_datasets.items():
-            dataloader = DataLoader(texts, batch_size=self.batch_size, shuffle=True)
+            model = deepcopy(pretrained_model).to(self.device).train()
             grad_accum = defaultdict(lambda: 0)
             num_samples = 0
 
+            dataloader = DataLoader(texts, batch_size=self.batch_size, shuffle=True)
+
             for batch in dataloader:
                 inputs = self.tokenizer(
-                    batch, return_tensors='pt', padding=True, truncation=True
+                    batch,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
                 ).to(self.device)
 
-                outputs = pretrained_model(**inputs, labels=inputs["input_ids"])
+                outputs = model(**inputs, labels=inputs["input_ids"])
                 loss = outputs.loss
-
-                pretrained_model.zero_grad()
+                model.zero_grad()
                 loss.backward()
 
-                for name, param in pretrained_model.named_parameters():
+                for name, param in model.named_parameters():
                     if param.grad is not None and param.requires_grad:
-                        grad = param.grad.detach().abs().cpu()
-                        grad_accum[name] = grad_accum[name] + grad if isinstance(grad_accum[name], Tensor) else grad
+                        grad = param.grad.detach().abs().cpu().to(torch.bfloat16)
+                        if isinstance(grad_accum[name], Tensor):
+                            grad_accum[name] += grad
+                        else:
+                            grad_accum[name] = grad
 
                 num_samples += len(batch)
                 if num_samples >= self.max_samples:
